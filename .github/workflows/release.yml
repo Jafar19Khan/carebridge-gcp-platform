@@ -26,13 +26,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build (not pushed yet)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./${{ matrix.service }}
           load: true
           tags: carebridge-${{ matrix.service }}:release
       - name: Push versioned image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./${{ matrix.service }}
           push: true
