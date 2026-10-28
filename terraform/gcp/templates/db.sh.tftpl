@@ -1,0 +1,53 @@
+#!/bin/bash
+# CareBridge data tier: MySQL 8 in Docker, data on the boot disk, daily dump to a private GCS bucket.
+set -euo pipefail
+exec > >(tee /var/log/carebridge-startup.log) 2>&1
+
+if [ ! -f /swapfile ]; then fallocate -l 1G /swapfile; chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile; echo '/swapfile none swap sw 0 0' >> /etc/fstab; fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y docker.io jq curl cron
+systemctl enable --now docker cron
+
+TOKEN=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)
+secret() {
+  local name="$1" value=""
+  for attempt in $(seq 1 12); do
+    if value=$(curl -sf -H "Authorization: Bearer $TOKEN" "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/${prefix}-$name/versions/latest:access" | jq -er .payload.data | base64 -d); then
+      printf '%s' "$value"
+      return 0
+    fi
+    echo "Secret $name not ready (attempt $attempt/12); retrying" >&2
+    sleep 5
+  done
+  echo "Unable to read Secret Manager secret: $name" >&2
+  return 1
+}
+DBPASS=$(secret db-password)
+ROOTPASS=$(secret db-root-password)
+
+mkdir -p /var/lib/carebridge-mysql
+docker rm -f mysql || true
+docker run -d --name mysql --restart unless-stopped -p 3306:3306 \
+  -v /var/lib/carebridge-mysql:/var/lib/mysql \
+  -e MYSQL_DATABASE=carebridge -e MYSQL_USER=carebridge \
+  -e MYSQL_PASSWORD="$DBPASS" -e MYSQL_ROOT_PASSWORD="$ROOTPASS" \
+  mysql:8.0 --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci \
+  --innodb-buffer-pool-size=256M --performance-schema=OFF
+
+# ---- nightly backup (02:00) -> gs://${bucket}; this VM can create objects but not read/delete them ----
+cat > /usr/local/bin/carebridge-backup.sh <<'BACKUP'
+#!/bin/bash
+set -euo pipefail
+TOKEN=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)
+ROOTPASS=$(curl -sf -H "Authorization: Bearer $TOKEN" "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/${prefix}-db-root-password/versions/latest:access" | jq -r .payload.data | base64 -d)
+NAME="db-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+docker exec -e MYSQL_PWD="$ROOTPASS" mysql mysqldump -uroot --single-transaction --routines --no-tablespaces carebridge | gzip > "/tmp/$NAME"
+[ "$(gzip -dc "/tmp/$NAME" | grep -c 'CREATE TABLE')" -ge 5 ] || { echo "dump looks empty" >&2; exit 1; }
+curl -sf -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/gzip" --data-binary "@/tmp/$NAME" \
+  "https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=$NAME" > /dev/null
+rm -f "/tmp/$NAME"
+echo "backup uploaded: $NAME"
+BACKUP
+chmod 700 /usr/local/bin/carebridge-backup.sh
+echo '0 2 * * * root /usr/local/bin/carebridge-backup.sh >> /var/log/carebridge-backup.log 2>&1' > /etc/cron.d/carebridge-backup

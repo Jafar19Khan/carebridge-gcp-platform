@@ -1,0 +1,81 @@
+# CareBridge – full stack in one command:  docker compose up --build -d
+# Copy .env.docker.example to .env first and set real secrets.
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-carebridge}
+      MYSQL_USER: ${DB_USER:-carebridge}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # No published port: the database is reachable only from other containers.
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: ${DB_USER:-carebridge}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-carebridge}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (32+ chars) in .env}
+      JWT_EXPIRES_IN: 8h
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      PAYMENT_MODE: ${PAYMENT_MODE:-local}
+      SEED_INITIAL_DATA: ${SEED_INITIAL_DATA:-true}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@carebridge.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set in .env}
+      BOOTSTRAP_PATIENT_PASSWORD: ${BOOTSTRAP_PATIENT_PASSWORD:?set in .env}
+      BOOTSTRAP_DOCTOR_PASSWORD: ${BOOTSTRAP_DOCTOR_PASSWORD:?set in .env}
+    volumes:
+      - uploads:/app/uploads
+
+  # One-shot job: create tables and demo data, then exit. Safe to re-run.
+  migrate:
+    build: ./backend
+    profiles: ["setup"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_USER: ${DB_USER:-carebridge}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-carebridge}
+      SEED_INITIAL_DATA: ${SEED_INITIAL_DATA:-true}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@carebridge.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+      BOOTSTRAP_PATIENT_PASSWORD: ${BOOTSTRAP_PATIENT_PASSWORD}
+      BOOTSTRAP_DOCTOR_PASSWORD: ${BOOTSTRAP_DOCTOR_PASSWORD}
+    command: ["npm", "run", "db:setup"]
+    restart: "no"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+volumes:
+  db_data:
+  uploads:

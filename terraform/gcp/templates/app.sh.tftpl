@@ -1,0 +1,79 @@
+#!/bin/bash
+# CareBridge application tier: Node/Express API in Docker. Talks only to the DB tier; reachable only from the web tier.
+set -euo pipefail
+exec > >(tee /var/log/carebridge-startup.log) 2>&1
+
+if [ ! -f /swapfile ]; then fallocate -l 1G /swapfile; chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile; echo '/swapfile none swap sw 0 0' >> /etc/fstab; fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y docker.io jq curl cron
+systemctl enable --now docker cron
+
+TOKEN=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)
+secret() {
+  local name="$1" value=""
+  for attempt in $(seq 1 12); do
+    if value=$(curl -sf -H "Authorization: Bearer $TOKEN" "https://secretmanager.googleapis.com/v1/projects/${project_id}/secrets/${prefix}-$name/versions/latest:access" | jq -er .payload.data | base64 -d); then
+      printf '%s' "$value"
+      return 0
+    fi
+    echo "Secret $name not ready (attempt $attempt/12); retrying" >&2
+    sleep 5
+  done
+  echo "Unable to read Secret Manager secret: $name" >&2
+  return 1
+}
+
+umask 077
+cat > /etc/carebridge.env <<ENVFILE
+NODE_ENV=production
+HOST=0.0.0.0
+PORT=4000
+DB_HOST=${db_ip}
+DB_PORT=3306
+DB_USER=carebridge
+DB_PASSWORD=$(secret db-password)
+DB_NAME=carebridge
+JWT_SECRET=$(secret jwt-secret)
+JWT_EXPIRES_IN=8h
+CORS_ORIGIN=http://${web_ip}
+PAYMENT_MODE=local
+SEED_INITIAL_DATA=true
+BOOTSTRAP_ADMIN_PASSWORD=$(secret bootstrap-admin-password)
+BOOTSTRAP_PATIENT_PASSWORD=$(secret bootstrap-patient-password)
+BOOTSTRAP_DOCTOR_PASSWORD=$(secret bootstrap-doctor-password)
+ENVFILE
+umask 022
+
+# Wait for the database tier, then create schema + demo data (idempotent).
+until (echo > /dev/tcp/${db_ip}/3306) 2>/dev/null; do echo "waiting for db tier"; sleep 5; done
+docker pull ${image}
+setup_ok=false
+for i in $(seq 1 20); do
+  if docker run --rm --env-file /etc/carebridge.env ${image} npm run db:setup; then setup_ok=true; break; fi
+  echo "db:setup attempt $i failed, retrying"; sleep 10
+done
+[ "$setup_ok" = true ] || { echo "Database setup failed after 20 attempts" >&2; exit 1; }
+
+docker rm -f backend || true
+docker run -d --name backend --restart unless-stopped --env-file /etc/carebridge.env \
+  -p 4000:4000 -v carebridge-uploads:/app/uploads ${image}
+
+
+# Back up doctor profile uploads to the private bucket. This identity can create objects only.
+cat > /usr/local/bin/carebridge-uploads-backup.sh <<'UPLOADBACKUP'
+#!/bin/bash
+set -euo pipefail
+TOKEN=$(curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token)
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+NAME="uploads-$STAMP.tar.gz"
+SRC=/var/lib/docker/volumes/carebridge-uploads/_data
+[ -d "$SRC" ] || { echo "uploads volume not found: $SRC" >&2; exit 1; }
+tar -C "$SRC" -czf "/tmp/$NAME" .
+curl -sf -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/gzip" --data-binary "@/tmp/$NAME" \
+  "https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o?uploadType=media&name=$NAME" > /dev/null
+rm -f "/tmp/$NAME"
+echo "uploads backup uploaded: $NAME"
+UPLOADBACKUP
+chmod 700 /usr/local/bin/carebridge-uploads-backup.sh
+echo '15 2 * * * root /usr/local/bin/carebridge-uploads-backup.sh >> /var/log/carebridge-uploads-backup.log 2>&1' > /etc/cron.d/carebridge-uploads-backup

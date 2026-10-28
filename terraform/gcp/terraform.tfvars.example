@@ -1,0 +1,4 @@
+project_id = "your-gcp-project-id"
+ghcr_owner = "jafar19khan"   # lowercase GitHub username; the carebridge-backend/frontend packages must be Public
+image_tag  = "v1.0.0"        # a release tag you published
+# allowed_web_cidrs = ["YOUR.PUBLIC.IP/32"]   # recommended for a demo

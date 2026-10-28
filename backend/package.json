@@ -1,0 +1,28 @@
+{
+  "name": "carebridge-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "check": "node --check server.js && node --check db.js && node --check scripts/init-db.js && node --check scripts/seed.js",
+    "test": "node --test",
+    "db:init": "node scripts/init-db.js",
+    "db:seed": "node scripts/seed.js",
+    "db:setup": "npm run db:init && npm run db:seed"
+  },
+  "dependencies": {
+    "bcryptjs": "2.4.3",
+    "cors": "2.8.5",
+    "dotenv": "16.4.7",
+    "express": "4.21.2",
+    "jsonwebtoken": "9.0.2",
+    "mysql2": "3.14.1",
+    "multer": "2.0.2"
+  },
+  "engines": {
+    "node": ">=20.14.0",
+    "npm": ">=10.0.0"
+  }
+}

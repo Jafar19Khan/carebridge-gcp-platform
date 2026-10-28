@@ -1,0 +1,14 @@
+#!/bin/bash
+# CareBridge web tier: nginx serving the React build and proxying /api to the app tier's private IP.
+set -euo pipefail
+exec > >(tee /var/log/carebridge-startup.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y docker.io curl
+systemctl enable --now docker
+
+docker pull ${image}
+docker rm -f web || true
+docker run -d --name web --restart unless-stopped -p 80:80 \
+  -e API_UPSTREAM=http://${app_ip}:4000 ${image}
